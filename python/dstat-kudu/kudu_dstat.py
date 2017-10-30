@@ -30,7 +30,7 @@ def open_or_create_table(client, table, drop=False):
     # Create hash partitioning buckets
     partitioning = Partitioning().add_hash_partitions('ts', 2)
 
-    client.create_table(table, schema, partitioning)
+    client.create_table(table, schema, partitioning, n_replicas=1)
 
   return client.table(table)
 
