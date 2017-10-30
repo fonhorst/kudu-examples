@@ -6,7 +6,7 @@ import kudu
 import os
 
 import time
-from kudu.client import Partitioning
+from kudu.client import Partitioning, PartialRow
 from kudu.schema import ColumnSpec
 
 COL_NAMES_PLAIN_SET = ["ts" , "value"]
@@ -23,7 +23,7 @@ def columns_builder_plain():
     return schema
 
 
-class KuduTimePartOnly:
+class KuduTimeAndSensorPart:
     def __init__(self):
         self.max_ts = 100000
         self.max_A = 1000
@@ -39,9 +39,10 @@ class KuduTimePartOnly:
 
     def _columns_builder(self):
         builder = kudu.schema_builder()
-        builder.add_column('ts').type(kudu.int64).nullable(False).primary_key()
+        builder.add_column('ts').type(kudu.int64).nullable(False)
         builder.add_column('sensor').type(kudu.int32).nullable(False)
         builder.add_column('value').type(kudu.float).nullable(False)
+        builder.set_primary_keys(['ts', 'sensor'])
         schema = builder.build()
         return schema
 
@@ -57,7 +58,7 @@ class KuduTimePartOnly:
 
         return partitioning
 
-    def __open_or_create_table(self, name, drop=False):
+    def __open_or_create_table(self, name, partitioning, drop=False):
         """Based on the default dstat column names create a new table indexed by a timstamp col"""
         exists = False
         hasBeenCreated = False
@@ -76,7 +77,6 @@ class KuduTimePartOnly:
                                     "Cannot continue".format(self.table_name))
 
         if not exists:
-            partitioning = self._make_partitioning()
             self.client.create_table(name, schema, partitioning, n_replicas=1)
             hasBeenCreated = True
 
@@ -86,17 +86,69 @@ class KuduTimePartOnly:
         for ts in range(count):
             yield (ts, random.randint(0, 10), random.random() * self.max_A)
 
+    def obtainTableForFillingWith(self, sequence: List, sensorIds: List[int]):
+        if len(sequence) == 0:
+            raise Exception("Sequence cannot be empty")
+
+        ts_min, value_min = sequence[0]
+        ts_max, value_max = sequence[-1]
+        ts_max += 1
+
+        week_len = 60 * 24 * 7 * 60000
+
+        weeks_count = int((ts_max - ts_min) / week_len)
+        weeks_count = weeks_count if (ts_max - ts_min) % week_len == 0 else weeks_count + 1
+
+        partitioning = Partitioning() \
+            .set_range_partition_columns("ts")
+
+        ts_start = ts_min
+        ts_end = ts_start + week_len
+
+
+        partitioning = partitioning.add_range_partition(lower_bound={"ts": 0},
+                                                        upper_bound={"ts": ts_start},
+                                                        lower_bound_type='inclusive',
+                                                        upper_bound_type='exclusive')
+
+        for wI in range(weeks_count):
+            partitioning = partitioning.add_range_partition(lower_bound={"ts": ts_start},
+                                                            upper_bound={"ts": ts_end},
+                                             lower_bound_type='inclusive',
+                                             upper_bound_type='exclusive')
+            ts_start = ts_end
+            ts_end = ts_end + week_len
+
+        partitioning = partitioning.add_range_partition(lower_bound={"ts": ts_end},
+                                                        upper_bound=None,
+                                                        lower_bound_type='inclusive',
+                                                        upper_bound_type='exclusive')
+
+        partitioning = partitioning.add_hash_partitions(["sensor"], num_buckets=len(sensorIds))
+
+        self.table, hasBeenCreated = self.__open_or_create_table(self.table_name, partitioning, drop=True)
+
+        if not hasBeenCreated:
+            raise Exception("Table has not been created")
+
+        self.fill_table_from_seq(sequence, sensorIds)
+
+        pass
+
     def obtainTable(self, recreate=False):
-        self.table, hasBeenCreated = self.__open_or_create_table(self.table_name, drop=recreate)
+        partitioning = self._make_partitioning()
+        self.table, hasBeenCreated = self.__open_or_create_table(self.table_name, partitioning, drop=recreate)
 
     def obtainAndFillTable(self):
-        self.table, hasBeenCreated = self.__open_or_create_table(self.table_name, drop=False)
+        partitioning = self._make_partitioning()
+        self.table, hasBeenCreated = self.__open_or_create_table(self.table_name, partitioning, drop=False)
 
         if hasBeenCreated:
             self.fill_table()
 
     def create_table(self):
-        self.table, _ = self.__open_or_create_table(self.table_name, drop=True)
+        partitioning = self._make_partitioning()
+        self.table, _ = self.__open_or_create_table(self.table_name, partitioning, drop=True)
 
     def remove_table(self):
         if self.client.table_exists(self.table_name):
@@ -125,12 +177,14 @@ class KuduTimePartOnly:
 
         return lst
 
-    def fill_table_from_seq(self, sequence: List, sensorId: int):
-        for i, (ts, value) in enumerate(sequence):
-            op = self.table.new_insert({"ts": ts, "sensor": sensorId, "value": value})
-            self.session.apply(op)
-            if i % 100000:
-                self.session.flush()
+    def fill_table_from_seq(self, sequence: List, sensorIds: List[int]):
+        for sensorId in sensorIds:
+            for i, (ts, value) in enumerate(sequence):
+                op = self.table.new_insert({"ts": ts, "sensor": sensorId, "value": value})
+                self.session.apply(op)
+                if i % 10000:
+                    self.session.flush()
+            self.session.flush()
 
         self.session.flush()
 
@@ -144,6 +198,16 @@ class KuduTimePartOnly:
 
         return tupleResults
 
+    def look_for_value(self, amin, amax):
+        sc = self.table.scanner()
+        # sc.add_predicate(amin < self.table['ts'] < amax)
+        sc.add_predicate(amin < self.table['value'])
+        sc.add_predicate(self.table['value'] < amax)
+
+        tupleResults = sc.open().read_all_tuples()
+
+        return tupleResults
+
     def get_all_data(self):
         sc = self.table.scanner()
         tupleResults = sc.open().read_all_tuples()
@@ -152,41 +216,10 @@ class KuduTimePartOnly:
     pass
 
 
-class KuduTimeSensorPart(KuduTimePartOnly):
-    def __init__(self, sensors_num = 10) -> None:
-        super().__init__()
-
-        self.sensors_num = sensors_num
-        self.table_name = "kuduTSTimeSensorPart"
-
-    def _columns_builder(self):
-        builder = kudu.schema_builder()
-        builder.add_column('ts').type(kudu.int64).nullable(False)
-        builder.add_column('sensor').type(kudu.int32).nullable(False)
-        builder.add_column('value').type(kudu.float).nullable(False)
-        builder.set_primary_keys(['ts', 'sensor'])
-        schema = builder.build()
-        return schema
-
-    def _make_partitioning(self):
-        # Create hash partitioning buckets
-        # partitioning = Partitioning().add_hash_partitions('ts', 2)
-        partitioning = Partitioning() \
-            .set_range_partition_columns("ts") \
-            .add_range_partition(lower_bound=None,
-                                 upper_bound=None,
-                                 lower_bound_type='inclusive',
-                                 upper_bound_type='exclusive') \
-            .add_hash_partitions(["sensor"], num_buckets=self.sensors_num)
-
-
-        return partitioning
-
-
-def checkInterval(kuduExample: KuduTimePartOnly):
+def checkInterval(kuduExample: KuduTimeAndSensorPart):
     kuduExample.obtainAndFillTable()
 
-    ainterval = kuduExample.look_for_ampl_interval(100, 1000)
+    ainterval = kuduExample.look_for_ampl_interval(-100, 500)
 
     print("Count of rows in the table '{}': {}".format(kuduExample.table_name, len(ainterval)))
 
@@ -194,7 +227,24 @@ def checkInterval(kuduExample: KuduTimePartOnly):
         print("ts {} sensor {} - value {}".format(ts, sensor, value))
 
 
-def getAllData(kuduExample: KuduTimePartOnly):
+def checkValue(kuduExample: KuduTimeAndSensorPart, lr=(-100, 500)):
+    kuduExample.obtainAndFillTable()
+
+    amin, amax = lr
+
+    start = time.time()
+    ainterval = list(kuduExample.look_for_value(amin, amax))
+    end = time.time()
+
+    print("Checking value time: {}".format(end - start))
+
+    print("Count of rows for defined values '{}': {}".format(kuduExample.table_name, len(ainterval)))
+
+    for ts, sensor, value in ainterval[:10]:
+        print("ts {} sensor {} - value {}".format(ts, sensor, value))
+
+
+def getAllData(kuduExample: KuduTimeAndSensorPart):
     kuduExample.obtainAndFillTable()
 
     ainterval = kuduExample.get_all_data()
@@ -205,6 +255,27 @@ def getAllData(kuduExample: KuduTimePartOnly):
         print("ts {} sensor {} - value {}".format(ts, sensor, value))
 
 
+def insertData(kuduExample: KuduTimeAndSensorPart):
+    insertMultiData(kuduExample, sensorIds=[1])
+
+
+def insertMultiData(kuduExample: KuduTimeAndSensorPart, sensorIds: List[int]):
+    start = time.time()
+    # sequence = kuduExample.sequence_from_file("sensor-1-2007-2017.csv")
+    sequence = kuduExample.sequence_from_file("tiny-sample-1-10k.csv")
+    end = time.time()
+    print("Reading raw data time: {}".format(end - start))
+
+    start = time.time()
+
+    kuduExample.obtainTableForFillingWith(sequence, sensorIds=sensorIds)
+    # kuduExample.obtainTable(recreate=True)
+    # kuduExample.fill_table_from_seq(sequence, sensorId)
+
+    end = time.time()
+
+    print("Inserting time: {}".format(end - start))
+
 if __name__ == "__main__":
     # kuduExample = KuduTimePartOnly()
 
@@ -212,24 +283,14 @@ if __name__ == "__main__":
     # kuduExample.remove_table()
 
     # kuduExample = KuduTimeSensorPart()
-    kuduExample = KuduTimePartOnly()
-    sensorId = 1
+    kuduExample = KuduTimeAndSensorPart()
 
-    start = time.time()
-    sequence = kuduExample.sequence_from_file("sensor-1-2007-2017.csv")
-    end = time.time()
-    print("Reading raw data time: {}".format(end - start))
-
-    start = time.time()
-
-    kuduExample.obtainTable(recreate=True)
-    kuduExample.fill_table_from_seq(sequence, sensorId)
-
-    end = time.time()
-
-    print("Inserting time: {}".format(end - start))
+    # insertData(kuduExample)
+    insertMultiData(kuduExample, sensorIds=[i for i in range(10)])
 
     # getAllData(kuduExample)
+
+    checkValue(kuduExample, (299, 302))
     # checkInterval(kuduExample)
     # kuduExample.remove_table()
     pass
