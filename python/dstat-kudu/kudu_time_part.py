@@ -6,6 +6,8 @@ import kudu
 import os
 
 import time
+
+import sys
 from kudu.client import Partitioning, PartialRow
 from kudu.schema import ColumnSpec
 
@@ -28,8 +30,10 @@ class KuduTimeAndSensorPart:
         self.max_ts = 100000
         self.max_A = 1000
 
-        self.client = kudu.connect("127.0.0.1", 7051)
-        self.session = self.client.new_session()
+        self.ITEM_TO_WRITE_PER_FLUSH = 100000
+
+        self.client = kudu.connect("192.168.13.133", 7051)
+        self.session = self.client.new_session(flush_mode='manual', timeout_ms=25000)
 
         self.table_name = "kuduTSTimePart"
 
@@ -94,16 +98,21 @@ class KuduTimeAndSensorPart:
         ts_max, value_max = sequence[-1]
         ts_max += 1
 
-        week_len = 60 * 24 * 7 * 60000
+        day_len = 60 * 24 * 60000
+        week_len = day_len * 7
+        month_len = day_len * 30
+        year_len = day_len * 365
 
-        weeks_count = int((ts_max - ts_min) / week_len)
-        weeks_count = weeks_count if (ts_max - ts_min) % week_len == 0 else weeks_count + 1
+        part_interval_len = week_len
+
+        parts_count = int((ts_max - ts_min) / part_interval_len)
+        parts_count = parts_count if (ts_max - ts_min) % part_interval_len == 0 else parts_count + 1
 
         partitioning = Partitioning() \
             .set_range_partition_columns("ts")
 
         ts_start = ts_min
-        ts_end = ts_start + week_len
+        ts_end = ts_start + part_interval_len
 
 
         partitioning = partitioning.add_range_partition(lower_bound={"ts": 0},
@@ -111,20 +120,22 @@ class KuduTimeAndSensorPart:
                                                         lower_bound_type='inclusive',
                                                         upper_bound_type='exclusive')
 
-        for wI in range(weeks_count):
+        for wI in range(parts_count):
             partitioning = partitioning.add_range_partition(lower_bound={"ts": ts_start},
                                                             upper_bound={"ts": ts_end},
                                              lower_bound_type='inclusive',
                                              upper_bound_type='exclusive')
             ts_start = ts_end
-            ts_end = ts_end + week_len
+            ts_end = ts_end + part_interval_len
 
         partitioning = partitioning.add_range_partition(lower_bound={"ts": ts_end},
                                                         upper_bound=None,
                                                         lower_bound_type='inclusive',
                                                         upper_bound_type='exclusive')
 
-        partitioning = partitioning.add_hash_partitions(["sensor"], num_buckets=len(sensorIds))
+
+        if len(sensorIds) > 1:
+            partitioning = partitioning.add_hash_partitions(["sensor"], num_buckets=len(sensorIds))
 
         self.table, hasBeenCreated = self.__open_or_create_table(self.table_name, partitioning, drop=True)
 
@@ -178,12 +189,18 @@ class KuduTimeAndSensorPart:
         return lst
 
     def fill_table_from_seq(self, sequence: List, sensorIds: List[int]):
-        for sensorId in sensorIds:
+        self.session.set_flush_mode(flush_mode='manual')
+
+        for j, sensorId in enumerate(sensorIds):
             for i, (ts, value) in enumerate(sequence):
                 op = self.table.new_insert({"ts": ts, "sensor": sensorId, "value": value})
                 self.session.apply(op)
-                if i % 10000:
+                if i % self.ITEM_TO_WRITE_PER_FLUSH == 0:
                     self.session.flush()
+                    currWrite = j * len(sequence) + i
+                    allToWrite = len(sensorIds) * len(sequence)
+                    print("Writing {}/{} records".format(currWrite, allToWrite))
+
             self.session.flush()
 
         self.session.flush()
@@ -261,8 +278,8 @@ def insertData(kuduExample: KuduTimeAndSensorPart):
 
 def insertMultiData(kuduExample: KuduTimeAndSensorPart, sensorIds: List[int]):
     start = time.time()
-    # sequence = kuduExample.sequence_from_file("sensor-1-2007-2017.csv")
-    sequence = kuduExample.sequence_from_file("tiny-sample-1-10k.csv")
+    sequence = kuduExample.sequence_from_file("sensor-1-2007-2017.csv")
+    # sequence = kuduExample.sequence_from_file("tiny-sample-1-1kk.csv")
     end = time.time()
     print("Reading raw data time: {}".format(end - start))
 
@@ -276,21 +293,26 @@ def insertMultiData(kuduExample: KuduTimeAndSensorPart, sensorIds: List[int]):
 
     print("Inserting time: {}".format(end - start))
 
+
 if __name__ == "__main__":
-    # kuduExample = KuduTimePartOnly()
+    cmd = "check"
+    if len(sys.argv) > 1:
+        cmd = sys.argv[1]
 
-    # kuduExample = KuduTimeSensorPart()
-    # kuduExample.remove_table()
-
-    # kuduExample = KuduTimeSensorPart()
     kuduExample = KuduTimeAndSensorPart()
 
-    # insertData(kuduExample)
-    insertMultiData(kuduExample, sensorIds=[i for i in range(10)])
+    if cmd == "insert":
+        insertMultiData(kuduExample, sensorIds=[i for i in range(1)])
+
+    elif cmd == "check":
+        checkValue(kuduExample, (265, 300))
+
+    elif cmd == "remove":
+        kuduExample.remove_table()
+    else:
+        print("Command is not recognized: {}".format(cmd))
+        sys.exit(-1)
 
     # getAllData(kuduExample)
-
-    checkValue(kuduExample, (299, 302))
     # checkInterval(kuduExample)
-    # kuduExample.remove_table()
     pass
